@@ -22,19 +22,23 @@ TEXT = Translation.TEXT
 @Client.on_callback_query(filters.regex(r'^start_public'))
 async def pub_(bot, message):
     user = message.from_user.id
-    temp.CANCEL[user] = False
-    # Limit concurrency to stay fast without creating an uncontrolled flood of API calls.
-    SEND_CONCURRENCY = 10
+    # Cancellation is tracked per task so parallel workers remain independent.
     frwd_id = message.data.split("_")[2]
-    if temp.lock.get(user) and str(temp.lock.get(user))=="True":
-      return await message.answer("please wait until previous task complete", show_alert=True)
+    active_workers = temp.lock.get(user, {})
+    if not isinstance(active_workers, dict):
+      active_workers = {}
+      temp.lock[user] = active_workers
     sts = STS(frwd_id)
     if not sts.verify():
       await message.answer("your are clicking on my old button", show_alert=True)
       return await message.message.delete()
     i = sts.get(full=True)
-    if i.TO in temp.IS_FRWD_CHAT:
-      return await message.answer("In Target chat a task is progressing. please wait until task complete", show_alert=True)
+    worker_id = getattr(i, "bot_id", None)
+    if worker_id in active_workers:
+      return await message.answer("This worker is already busy. Choose another bot/worker.", show_alert=True)
+    if len(active_workers) >= Config.MAX_PARALLEL_FORWARD_TASKS:
+      return await message.answer("Maximum 3 parallel forwarding tasks are allowed.", show_alert=True)
+    temp.CANCEL[sts.id] = False
     m = await msg_edit(message.message, "<code>verifying your data's, please wait.</code>")
     _bot, caption, forward_tag, data, protect, button = await sts.get_data(user)
     if not _bot:
@@ -49,25 +53,33 @@ async def pub_(bot, message):
        await client.get_messages(sts.get("FROM"), 1)
     except:
        await msg_edit(m, f"**Source chat may be a private channel / group. Use userbot (user must be member over there) or  if Make Your [Bot](t.me/{_bot['username']}) an admin over there**", retry_btn(frwd_id), True)
-       return await stop(client, user)
+       return await stop(client, user, None, None)
     try:
        k = await client.send_message(i.TO, "Testing")
        await k.delete()
     except:
        await msg_edit(m, f"**Please Make Your [UserBot / Bot](t.me/{_bot['username']}) Admin In Target Channel With Full Permissions**", retry_btn(frwd_id), True)
-       return await stop(client, user)
+       return await stop(client, user, None, None)
+    active_workers[worker_id] = sts.id
+    temp.lock[user] = active_workers
     temp.forwardings += 1
-    await db.add_frwd(user)
+    await db.add_frwd(user, sts.id)
     await send(client, user, "<b>ғᴏʀᴡᴀʀᴅɪɴɢ sᴛᴀʀᴛᴇᴅ <a href=https://t.me/dev_gagan>Dev Gagan</a></b>")
     sts.add(time=True)
-    sleep = 1 if _bot['is_bot'] else 10
+    # Copy mode has a small cooperative delay to avoid hammering Telegram.
+    # Forward mode below uses Telegram's batch API and does not add this delay.
+    sleep = 0.05 if _bot['is_bot'] else 0.10
     await msg_edit(m, "<code>Processing...</code>") 
     temp.IS_FRWD_CHAT.append(i.TO)
-    temp.lock[user] = locked = True
+    locked = True
     if locked:
         try:
           MSG = []
           pling=0
+          # One logical batch is 1000 messages. Telegram API requests are
+          # split into 100-message chunks inside forward().
+          FORWARD_BATCH_SIZE = Config.FORWARD_LOGICAL_BATCH_SIZE
+          PROGRESS_UPDATE_EVERY = Config.FORWARD_LOGICAL_BATCH_SIZE
           await edit(m, 'Progressing', 10, sts)
           print(f"Starting Forwarding Process... From :{sts.get('FROM')} To: {sts.get('TO')} Totel: {sts.get('limit')} stats : {sts.get('skip')})")
 
@@ -83,7 +95,7 @@ async def pub_(bot, message):
             ):
                 if await is_cancelled(client, user, m, sts):
                    return
-                if pling %20 == 0: 
+                if pling % PROGRESS_UPDATE_EVERY == 0: 
                    await edit(m, 'Progressing', 10, sts)
                 pling += 1
                 sts.add('fetched')
@@ -98,47 +110,34 @@ async def pub_(bot, message):
                    continue
                 if forward_tag:
                    MSG.append(message.id)
-                   notcompleted = len(MSG)
-                   completed = sts.get('total') - sts.get('fetched')
-                   if ( notcompleted >= 100 
-                        or completed <= 100): 
+                   if len(MSG) >= FORWARD_BATCH_SIZE:
+                      batch_count = len(MSG)
                       await forward(client, MSG, m, sts, protect)
-                      sts.add('total_files', notcompleted)
+                      sts.add('total_files', batch_count)
                       MSG = []
                 else:
                    new_caption = custom_caption(message, caption)
                    details = {"msg_id": message.id, "media": media(message), "caption": new_caption, 'button': button, "protect": protect}
-                   # Queue small batches and send concurrently instead of waiting
-                   # 1-10 seconds after every single message.
-                   pending = locals().get('_pending_copies')
-                   if pending is None:
-                       pending = []
-                       _pending_copies = pending
-                   pending.append(details)
-                   if len(pending) >= SEND_CONCURRENCY:
-                       await asyncio.gather(
-                           *(copy(client, item, m, sts) for item in pending),
-                           return_exceptions=True
-                       )
-                       sts.add('total_files', len(pending))
-                       pending.clear()
-          # Flush any remaining queued copies.
-          pending = locals().get('_pending_copies')
-          if pending:
-              await asyncio.gather(
-                  *(copy(client, item, m, sts) for item in pending),
-                  return_exceptions=True
-              )
-              sts.add('total_files', len(pending))
-              pending.clear()
+                   await copy(client, details, m, sts)
+                   sts.add('total_files')
+                   await asyncio.sleep(sleep) 
+
+          # Flush the final partial batch. This is essential when the total
+          # number of files is not an exact multiple of 1000.
+          if forward_tag and MSG:
+              batch_count = len(MSG)
+              await forward(client, MSG, m, sts, protect)
+              sts.add('total_files', batch_count)
+              MSG = []
         except Exception as e:
             await msg_edit(m, f'<b>ERROR:</b>\n<code>{e}</code>', wait=True)
-            temp.IS_FRWD_CHAT.remove(sts.TO)
-            return await stop(client, user)
+            if sts.TO in temp.IS_FRWD_CHAT:
+                temp.IS_FRWD_CHAT.remove(sts.TO)
+            return await stop(client, user, worker_id, sts.id)
         temp.IS_FRWD_CHAT.remove(sts.TO)
         await send(client, user, "<b>🎉 ғᴏʀᴡᴀᴅɪɴɢ ᴄᴏᴍᴘʟᴇᴛᴇᴅ 🥀 <a href=https://t.me/dev_gagan>SUPPORT</a>🥀</b>")
         await edit(m, 'Completed', "completed", sts) 
-        await stop(client, user)
+        await stop(client, user, worker_id, sts.id)
             
 async def copy(bot, msg, m, sts):
    try:                                  
@@ -168,20 +167,30 @@ async def copy(bot, msg, m, sts):
      sts.add('deleted')
         
 async def forward(bot, msg, m, sts, protect):
-   try:                             
-     await bot.forward_messages(
-           chat_id=sts.get('TO'),
-           from_chat_id=sts.get('FROM'), 
-           protect_content=protect,
-           message_ids=msg)
-   except FloodWait as e:
-     await edit(m, 'Progressing', e.value, sts)
-     await asyncio.sleep(e.value)
-     await edit(m, 'Progressing', 10, sts)
-     await forward(bot, msg, m, sts, protect)
-   except Exception as e:
-      print(f"Failed to forward messages {msg}: {e}")
-      sts.add('deleted')
+   """Forward a logical batch safely in Telegram-sized chunks.
+
+   The caller accumulates up to 1000 message IDs. We split that batch into
+   smaller API requests so one oversized request cannot abort the whole task.
+   """
+   CHUNK_SIZE = Config.FORWARD_API_CHUNK_SIZE
+   for start in range(0, len(msg), CHUNK_SIZE):
+      chunk = msg[start:start + CHUNK_SIZE]
+      while True:
+         try:
+            await bot.forward_messages(
+                 chat_id=sts.get('TO'),
+                 from_chat_id=sts.get('FROM'),
+                 protect_content=protect,
+                 message_ids=chunk)
+            break
+         except FloodWait as e:
+            await edit(m, 'Progressing', e.value, sts)
+            await asyncio.sleep(e.value)
+            await edit(m, 'Progressing', 10, sts)
+         except Exception as e:
+            logger.exception("Failed to forward messages chunk %s-%s: %s", start, start + len(chunk), e)
+            # Do not abort the complete 1000-file batch because of one bad chunk.
+            break
 
 PROGRESS = """
 📈 Percetage: {0} %
@@ -234,27 +243,39 @@ async def edit(msg, title, status, sts):
          InlineKeyboardButton('Updates', url='https://t.me/dev_gagan')]
          )
    else:
-      button.append([InlineKeyboardButton('• ᴄᴀɴᴄᴇʟ', 'terminate_frwd')])
+      button.append([InlineKeyboardButton('• ᴄᴀɴᴄᴇʟ', f'terminate_frwd#{i.id}')])
    await msg_edit(msg, text, InlineKeyboardMarkup(button))
    
 async def is_cancelled(client, user, msg, sts):
-   if temp.CANCEL.get(user)==True:
-      temp.IS_FRWD_CHAT.remove(sts.TO)
+   if temp.CANCEL.get(sts.id, False)==True:
+      if sts.TO in temp.IS_FRWD_CHAT:
+         temp.IS_FRWD_CHAT.remove(sts.TO)
       await edit(msg, "Cancelled", "completed", sts)
       await send(client, user, "<b>❌ Forwarding Process Cancelled</b>")
-      await stop(client, user)
+      await stop(client, user, getattr(sts, "bot_id", None), sts.id)
       return True 
    return False 
 
-async def stop(client, user):
+async def stop(client, user, worker_id=None, task_id=None):
    try:
      await client.stop()
    except:
-     pass 
-   await db.rmve_frwd(user)
-   temp.forwardings -= 1
-   temp.lock[user] = False 
-    
+     pass
+   # Pre-flight failures happen before a task is registered; don't disturb
+   # other parallel workers in that case.
+   if task_id is None:
+      return
+   try:
+      await db.nfy.delete_one({'user_id': int(user), 'task_id': task_id})
+   except:
+      pass
+   temp.forwardings = max(0, temp.forwardings - 1)
+   active = temp.lock.get(user, {})
+   if isinstance(active, dict) and worker_id is not None:
+      active.pop(worker_id, None)
+      temp.lock[user] = active
+      temp.CANCEL.pop(task_id, None)
+
 async def send(bot, user, text):
    try:
       await bot.send_message(user, text=text)
@@ -307,12 +328,20 @@ def TimeFormatter(milliseconds: int) -> str:
 def retry_btn(id):
     return InlineKeyboardMarkup([[InlineKeyboardButton('♻️ RETRY ♻️', f"start_public_{id}")]])
 
-@Client.on_callback_query(filters.regex(r'^terminate_frwd$'))
+@Client.on_callback_query(filters.regex(r'^terminate_frwd(?:#(.+))?$'))
 async def terminate_frwding(bot, m):
-    user_id = m.from_user.id 
-    temp.lock[user_id] = False
-    temp.CANCEL[user_id] = True 
-    await m.answer("Forwarding cancelled !", show_alert=True)
+    user_id = m.from_user.id
+    parts = m.data.split('#', 1)
+    task_id = parts[1] if len(parts) == 2 else None
+    if task_id:
+        temp.CANCEL[task_id] = True
+        await m.answer("Forwarding task cancelled !", show_alert=True)
+    else:
+        active = temp.lock.get(user_id, {})
+        if isinstance(active, dict):
+            for tid in active.values():
+                temp.CANCEL[tid] = True
+        await m.answer("Forwarding tasks cancelled !", show_alert=True)
           
 @Client.on_callback_query(filters.regex(r'^fwrdstatus'))
 async def status_msg(bot, msg):
@@ -322,7 +351,7 @@ async def status_msg(bot, msg):
        fetched, forwarded, remaining = 0
     else:
        fetched, forwarded = sts.get('fetched'), sts.get('total_files')
-       remaining = fetched - forwarded 
+       remaining = max(0, fetched - forwarded) 
     est_time = TimeFormatter(milliseconds=est_time)
     est_time = est_time if (est_time != '' or status not in ['completed', 'cancelled']) else '0 s'
     return await msg.answer(PROGRESS.format(percentage, fetched, forwarded, remaining, status, est_time), show_alert=True)

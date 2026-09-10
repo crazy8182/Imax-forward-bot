@@ -35,49 +35,55 @@ async def start_clone_bot(FwdBot, data=None):
       filter: "types.TypeMessagesFilter" = None,
       continuous: bool = False
       ) -> Optional[AsyncGenerator["types.Message", None]]:
-        """Iterate through a chat by message ID without skipping ranges.
+        """Iterate through message IDs without skipping ranges.
 
-        `limit` is treated as the maximum message ID for normal forwarding.
-        For continuous mode the iterator keeps polling for new messages.
+        `offset` is the first message ID and `limit` is the last message ID
+        for normal forwarding tasks. Telegram message IDs can have gaps, so
+        the cursor advances by the requested ID range, not by the number of
+        returned messages.
         """
-        current = max(1, int(offset or 0))
+        current = max(0, int(offset or 0))
         limit = int(limit or 0)
 
         while True:
-            if not continuous and limit > 0 and current > limit:
-                return
+            if not continuous:
+                if limit <= 0 or current > limit:
+                    return
+                end_id = min(current + 199, limit)
+            else:
+                # In live mode, fetch a small window and continue polling.
+                end_id = current + 199
 
-            batch_end = current + 199
-            if not continuous and limit > 0:
-                batch_end = min(batch_end, limit)
-
-            ids = list(range(current, batch_end + 1))
-            if not ids:
-                return
-
+            ids = list(range(current, end_id + 1))
             try:
                 messages = await self.get_messages(chat_id, ids)
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 continue
-            except Exception:
+            except Exception as e:
+                logger.warning("get_messages failed for %s-%s: %s", current, end_id, e)
                 messages = []
 
             valid_messages = [m for m in messages if m and not m.empty]
 
-            if valid_messages:
-                for message in valid_messages:
-                    if not continuous and limit > 0 and message.id > limit:
-                        continue
-                    yield message
+            for message in valid_messages:
+                yield message
 
-            # IMPORTANT: advance only to the end of the requested ID range.
-            # The previous implementation advanced twice (inside the loop and
-            # again after the batch), which skipped thousands of message IDs.
-            current = batch_end + 1
+            # Always advance to the next ID range. Do not advance based on
+            # the number of valid messages because Telegram IDs may contain gaps.
+            current = end_id + 1
 
-            if continuous and not valid_messages:
-                await asyncio.sleep(2)
+            if continuous:
+                if not valid_messages:
+                    await asyncio.sleep(10)
+                    # Keep polling from the next ID only if new IDs exist;
+                    # this is primarily intended for Saved Messages live mode.
+                    current = max(current, int(limit or 0))
+                continue
+
+            if current > limit:
+                return
+
    #
    FwdBot.iter_messages = iter_messages
    return FwdBot
@@ -88,13 +94,18 @@ class CLIENT:
      self.api_hash = Config.API_HASH
     
   def client(self, data, user=None):
+     # Use an isolated Pyrogram session name for every configured worker so
+     # multiple forwarding tasks can run concurrently.
      if user == None and data.get('is_bot') == False:
-        return Client("USERBOT", self.api_id, self.api_hash, session_string=data.get('session'))
+        name = f"USERBOT_{data.get('id', 'worker')}"
+        return Client(name, self.api_id, self.api_hash, session_string=data.get('session'))
      elif user == True:
-        return Client("USERBOT", self.api_id, self.api_hash, session_string=data)
+        return Client("USERBOT_TEMP", self.api_id, self.api_hash, session_string=data)
      elif user != False:
-        data = data.get('token')
-     return Client("BOT", self.api_id, self.api_hash, bot_token=data, in_memory=True)
+        bot_token = data.get('token')
+        name = f"BOT_{data.get('id', 'worker')}"
+        return Client(name, self.api_id, self.api_hash, bot_token=bot_token, in_memory=True)
+     return Client("BOT_TEMP", self.api_id, self.api_hash, bot_token=data, in_memory=True)
   
   async def add_bot(self, bot, message):
      user_id = int(message.from_user.id)

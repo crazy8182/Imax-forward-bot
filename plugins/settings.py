@@ -3,6 +3,7 @@ from database import db
 from translation import Translation
 from pyrogram import Client, filters
 from .test import get_configs, update_configs, CLIENT, parse_buttons
+from config import Config
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 CLIENT = CLIENT()
@@ -27,23 +28,21 @@ async def settings_query(bot, query):
        reply_markup=main_buttons())
        
   elif type=="bots":
-     buttons = [] 
-     _bot = await db.get_bot(user_id)
-     if _bot is not None:
-        buttons.append([InlineKeyboardButton(_bot['name'],
-                         callback_data=f"settings#editbot")])
-     else:
-        buttons.append([InlineKeyboardButton('✚ Add bot ✚', 
-                         callback_data="settings#addbot")])
-        buttons.append([InlineKeyboardButton('✚ Add User bot ✚', 
-                         callback_data="settings#adduserbot")])
-     buttons.append([InlineKeyboardButton('↩ Back', 
-                      callback_data="settings#main")])
+     buttons = []
+     bots = await db.get_bots(user_id)
+     for idx, worker in enumerate(bots, 1):
+        label = f"{idx}. {worker['name']} (@{worker.get('username') or 'no_username'})"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"settings#editbot_{worker['id']}")])
+     buttons.append([InlineKeyboardButton('✚ Add bot ✚', callback_data="settings#addbot")])
+     buttons.append([InlineKeyboardButton('✚ Add User bot ✚', callback_data="settings#adduserbot")])
+     buttons.append([InlineKeyboardButton('↩ Back', callback_data="settings#main")])
      await query.message.edit_text(
-       "<b><u>My Bots</b></u>\n\n<b>You can manage your bots in here</b>",
+       f"<b><u>My Bots / Workers</b></u>\n\n<b>Configured workers: {len(bots)}/{Config.MAX_PARALLEL_FORWARD_TASKS}</b>\n<b>Use different workers for parallel forwarding tasks.</b>",
        reply_markup=InlineKeyboardMarkup(buttons))
   
   elif type=="addbot":
+     if len(await db.get_bots(user_id)) >= Config.MAX_PARALLEL_FORWARD_TASKS:
+        return await query.answer("Maximum 3 workers allowed", show_alert=True)
      await query.message.delete()
      bot = await CLIENT.add_bot(bot, query)
      if bot != True: return
@@ -52,6 +51,8 @@ async def settings_query(bot, query):
         reply_markup=InlineKeyboardMarkup(buttons))
   
   elif type=="adduserbot":
+     if len(await db.get_bots(user_id)) >= Config.MAX_PARALLEL_FORWARD_TASKS:
+        return await query.answer("Maximum 3 workers allowed", show_alert=True)
      await query.message.delete()
      user = await CLIENT.add_session(bot, query)
      if user != True: return
@@ -99,22 +100,23 @@ async def settings_query(bot, query):
      except asyncio.exceptions.TimeoutError:
          await text.edit_text('Process has been automatically cancelled', reply_markup=InlineKeyboardMarkup(buttons))
   
-  elif type=="editbot": 
-     bot = await db.get_bot(user_id)
-     TEXT = Translation.BOT_DETAILS if bot['is_bot'] else Translation.USER_DETAILS
-     buttons = [[InlineKeyboardButton('❌ Remove ❌', callback_data=f"settings#removebot")
-               ],
-               [InlineKeyboardButton('↩ Back', callback_data="settings#bots")]]
-     await query.message.edit_text(
-        TEXT.format(bot['name'], bot['id'], bot['username']),
-        reply_markup=InlineKeyboardMarkup(buttons))
-                                             
-  elif type=="removebot":
-     await db.remove_bot(user_id)
-     await query.message.edit_text(
-        "<b>successfully updated</b>",
-        reply_markup=InlineKeyboardMarkup(buttons))
-                                             
+  elif type.startswith("editbot"):
+     bot_id = int(type.split('_')[1]) if '_' in type else None
+     worker = await db.get_bot_by_id(user_id, bot_id) if bot_id else await db.get_bot(user_id)
+     if not worker:
+        return await query.answer("Worker not found", show_alert=True)
+     TEXT = Translation.BOT_DETAILS if worker['is_bot'] else Translation.USER_DETAILS
+     buttons = [[InlineKeyboardButton('❌ Remove ❌', callback_data=f"settings#removebot_{worker['id']}")],
+                [InlineKeyboardButton('↩ Back', callback_data="settings#bots")]]
+     await query.message.edit_text(TEXT.format(worker['name'], worker['id'], worker['username']),
+                                    reply_markup=InlineKeyboardMarkup(buttons))
+                                              
+  elif type.startswith("removebot"):
+     bot_id = int(type.split('_')[1]) if '_' in type else None
+     await db.remove_bot(user_id, bot_id)
+     await query.message.edit_text("<b>Worker removed successfully</b>",
+                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('↩ Back', callback_data="settings#bots")]]))
+                               
   elif type.startswith("editchannels"): 
      chat_id = type.split('_')[1]
      chat = await db.get_channel_details(user_id, chat_id)

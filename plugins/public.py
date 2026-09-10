@@ -17,9 +17,10 @@ async def run(bot, message):
     buttons = []
     btn_data = {}
     user_id = message.from_user.id
-    _bot = await db.get_bot(user_id)
-    if not _bot:
+    bots = await db.get_bots(user_id)
+    if not bots:
       return await message.reply("<code>You didn't added any bot. Please add a bot using /settings !</code>")
+    _bot = bots[0]
     channels = await db.get_user_channels(user_id)
     if not channels:
        return await message.reply_text("please set a to channel in /settings before forwarding")
@@ -38,6 +39,23 @@ async def run(bot, message):
     else:
        toid = channels[0]['chat_id']
        to_title = channels[0]['title']
+
+    # Pick the worker used for this task. Different workers can run in parallel.
+    if len(bots) > 1:
+       worker_buttons = [[KeyboardButton(f"{idx}. {w['name']} (@{w.get('username') or 'no_username'})")]
+                        for idx, w in enumerate(bots, 1)]
+       worker_buttons.append([KeyboardButton("cancel")])
+       worker_msg = await bot.ask(message.chat.id,
+                                  "<b>Choose forwarding worker/bot:</b>",
+                                  reply_markup=ReplyKeyboardMarkup(worker_buttons, one_time_keyboard=True, resize_keyboard=True))
+       if worker_msg.text.lower().startswith(('/', 'cancel')):
+          return await message.reply_text(Translation.CANCEL, reply_markup=ReplyKeyboardRemove())
+       try:
+          idx = int(worker_msg.text.split('.', 1)[0]) - 1
+          _bot = bots[idx]
+       except (ValueError, IndexError):
+          return await message.reply_text("Invalid worker selected.", reply_markup=ReplyKeyboardRemove())
+
     fromid = await bot.ask(message.chat.id, Translation.FROM_MSG, reply_markup=ReplyKeyboardRemove())
     if fromid.text and fromid.text.startswith('/'):
         await message.reply(Translation.CANCEL)
@@ -127,4 +145,4 @@ async def run(bot, message):
         disable_web_page_preview=True,
         reply_markup=reply_markup
     )
-    STS(forward_id).store(chat_id, toid, int(skipno.text), int(last_msg_id), continuous=continuous)
+    STS(forward_id).store(chat_id, toid, int(skipno.text), int(last_msg_id), continuous=continuous, bot_id=_bot['id'])
