@@ -113,18 +113,31 @@ class Database:
         return default 
        
     async def add_bot(self, datas):
-       if not await self.is_bot_exist(datas['user_id']):
-          await self.bot.insert_one(datas)
+       # Allow multiple worker bots/userbots per owner so separate forwarding
+       # tasks can run in parallel.
+       return await self.bot.insert_one(datas)
     
-    async def remove_bot(self, user_id):
-       await self.bot.delete_many({'user_id': int(user_id)})
+    async def remove_bot(self, user_id, bot_id=None):
+       query = {'user_id': int(user_id)}
+       if bot_id is not None:
+          query['id'] = int(bot_id)
+       return await self.bot.delete_many(query)
       
     async def get_bot(self, user_id: int):
-       bot = await self.bot.find_one({'user_id': user_id})
+       # Backward-compatible: return the first configured worker.
+       bot = await self.bot.find_one({'user_id': int(user_id)}, sort=[('_id', 1)])
+       return bot if bot else None
+
+    async def get_bots(self, user_id: int):
+       cursor = self.bot.find({'user_id': int(user_id)}).sort('_id', 1)
+       return [bot async for bot in cursor]
+
+    async def get_bot_by_id(self, user_id: int, bot_id: int):
+       bot = await self.bot.find_one({'user_id': int(user_id), 'id': int(bot_id)})
        return bot if bot else None
                                           
     async def is_bot_exist(self, user_id):
-       bot = await self.bot.find_one({'user_id': user_id})
+       bot = await self.bot.find_one({'user_id': int(user_id)})
        return bool(bot)
                                           
     async def in_channel(self, user_id: int, chat_id: int) -> bool:
@@ -158,8 +171,11 @@ class Database:
             filters.append(str(k))
        return filters
               
-    async def add_frwd(self, user_id):
-       return await self.nfy.insert_one({'user_id': int(user_id)})
+    async def add_frwd(self, user_id, task_id=None):
+       data = {'user_id': int(user_id)}
+       if task_id is not None:
+          data['task_id'] = task_id
+       return await self.nfy.insert_one(data)
     
     async def rmve_frwd(self, user_id=0, all=False):
        data = {} if all else {'user_id': int(user_id)}
