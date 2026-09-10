@@ -23,6 +23,8 @@ TEXT = Translation.TEXT
 async def pub_(bot, message):
     user = message.from_user.id
     temp.CANCEL[user] = False
+    # Limit concurrency to stay fast without creating an uncontrolled flood of API calls.
+    SEND_CONCURRENCY = 10
     frwd_id = message.data.split("_")[2]
     if temp.lock.get(user) and str(temp.lock.get(user))=="True":
       return await message.answer("please wait until previous task complete", show_alert=True)
@@ -102,14 +104,33 @@ async def pub_(bot, message):
                         or completed <= 100): 
                       await forward(client, MSG, m, sts, protect)
                       sts.add('total_files', notcompleted)
-                      await asyncio.sleep(10)
                       MSG = []
                 else:
                    new_caption = custom_caption(message, caption)
                    details = {"msg_id": message.id, "media": media(message), "caption": new_caption, 'button': button, "protect": protect}
-                   await copy(client, details, m, sts)
-                   sts.add('total_files')
-                   await asyncio.sleep(sleep) 
+                   # Queue small batches and send concurrently instead of waiting
+                   # 1-10 seconds after every single message.
+                   pending = locals().get('_pending_copies')
+                   if pending is None:
+                       pending = []
+                       _pending_copies = pending
+                   pending.append(details)
+                   if len(pending) >= SEND_CONCURRENCY:
+                       await asyncio.gather(
+                           *(copy(client, item, m, sts) for item in pending),
+                           return_exceptions=True
+                       )
+                       sts.add('total_files', len(pending))
+                       pending.clear()
+          # Flush any remaining queued copies.
+          pending = locals().get('_pending_copies')
+          if pending:
+              await asyncio.gather(
+                  *(copy(client, item, m, sts) for item in pending),
+                  return_exceptions=True
+              )
+              sts.add('total_files', len(pending))
+              pending.clear()
         except Exception as e:
             await msg_edit(m, f'<b>ERROR:</b>\n<code>{e}</code>', wait=True)
             temp.IS_FRWD_CHAT.remove(sts.TO)

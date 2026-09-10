@@ -27,84 +27,57 @@ async def start_clone_bot(FwdBot, data=None):
    await FwdBot.start()
    #
    async def iter_messages(
-      self, 
-      chat_id: Union[int, str], 
-      limit: int, 
+      self,
+      chat_id: Union[int, str],
+      limit: int,
       offset: int = 0,
       search: str = None,
       filter: "types.TypeMessagesFilter" = None,
       continuous: bool = False
       ) -> Optional[AsyncGenerator["types.Message", None]]:
-        """Iterate through a chat sequentially."""
-        current = offset
+        """Iterate through a chat by message ID without skipping ranges.
+
+        `limit` is treated as the maximum message ID for normal forwarding.
+        For continuous mode the iterator keeps polling for new messages.
+        """
+        current = max(1, int(offset or 0))
+        limit = int(limit or 0)
+
         while True:
-            # If continuous, we don't really have a limit, effectively infinite
-            # But we still use limit if provided to fetch batches
-            # If continuous=True, loop forever waiting for new messages
+            if not continuous and limit > 0 and current > limit:
+                return
 
-            # If batch fetch size is 200
-            new_diff = 200 # Default batch size
-
+            batch_end = current + 199
             if not continuous and limit > 0:
-                new_diff = min(200, limit - current)
-                if new_diff <= 0:
-                    return
+                batch_end = min(batch_end, limit)
+
+            ids = list(range(current, batch_end + 1))
+            if not ids:
+                return
 
             try:
-                messages = await self.get_messages(chat_id, list(range(current, current+new_diff+1)))
+                messages = await self.get_messages(chat_id, ids)
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 continue
             except Exception:
-                # If message doesn't exist (yet), get_messages returns None or list with None?
-                # Pyrogram get_messages with list returns list of Messages or None
                 messages = []
 
-            # Filter out None values (messages that don't exist yet)
             valid_messages = [m for m in messages if m and not m.empty]
 
-            if not valid_messages:
-                if continuous:
-                    # No new messages, wait and retry
-                    await asyncio.sleep(10)
-                    continue
-                else:
-                    # End of chat
-                    return
+            if valid_messages:
+                for message in valid_messages:
+                    if not continuous and limit > 0 and message.id > limit:
+                        continue
+                    yield message
 
-            for message in valid_messages:
-                yield message
-                current = max(current, message.id) + 1
+            # IMPORTANT: advance only to the end of the requested ID range.
+            # The previous implementation advanced twice (inside the loop and
+            # again after the batch), which skipped thousands of message IDs.
+            current = batch_end + 1
 
-            # If we got fewer messages than requested, and not continuous, it might be end?
-            # But we are iterating by ID range, so gaps are possible.
-            # We just increment current.
-            if not valid_messages and not continuous:
-                 return
-
-            # Optimization: if valid_messages is empty but we are in continuous mode, we handled it above.
-            # If valid_messages is NOT empty, we processed them.
-            # Update current to be next ID.
-
-            current = list(range(current, current+new_diff+1))[-1] + 1
-            # Wait, the range logic above: range(current, current+new_diff+1)
-            # If current=0, new_diff=200. range(0, 201). IDs 0..200.
-            # Next iteration should start at 201.
-            # So current += new_diff + 1?
-            # No, if we yield, we just continue loop.
-            # But we need to update 'current' for next batch.
-            # My previous logic: `current += 1` inside loop was weird because `messages` is a batch.
-
-            # Let's fix the batch logic properly
-            # The original code:
-            # messages = await self.get_messages(chat_id, list(range(current, current+new_diff+1)))
-            # for message in messages: yield message; current += 1
-            # This assumed sequential IDs and incrementing current.
-
-            # New logic:
-            # Just increment current by batch size at the end of loop
-            current += (new_diff + 1)
-
+            if continuous and not valid_messages:
+                await asyncio.sleep(2)
    #
    FwdBot.iter_messages = iter_messages
    return FwdBot
